@@ -1,54 +1,20 @@
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { getRules } from "./src/compensation.js";
+import { createModel, listModels } from "./src/modelArchive.js";
+import {
+  addInitial,
+  addRemeasure,
+  getBatch,
+  listBatches,
+  listSnapshots,
+  openBatch,
+  reviseInitial,
+  sealBatch,
+  stats
+} from "./src/recordStore.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = join(__dirname, "data", "model-rigging-calibration.json");
 const port = Number(process.env.PORT || 3038);
-const seed = {
-  "items": [
-    {
-      "code": "MR-001",
-      "shipType": "福船",
-      "scale": "1:48",
-      "mastCount": 3,
-      "riggingMaterial": "蜡线",
-      "owner": "周宁",
-      "dueDate": "2026-06-28",
-      "status": "校准中",
-      "tasks": [
-        {
-          "id": "T-1",
-          "position": "前桅侧支索",
-          "tension": "偏松",
-          "status": "调整中",
-          "logs": [
-            {
-              "at": "2026-06-12",
-              "note": "已缩短2mm"
-            }
-          ]
-        }
-      ],
-      "logs": []
-    }
-  ]
-};
-const fields = [["code","模型编号","text"],["shipType","船型","text"],["scale","比例","text"],["mastCount","桅杆数量","number"],["riggingMaterial","帆索材料","text"],["owner","负责人","text"],["dueDate","交付日期","date"]];
-const stages = ["待检查","校准中","待复核","已交付"];
-const statLabels = ["待检查","校准中","待复核","已交付"];
-const extraFields = [["position","索具位置"],["tension","松紧状态"],["note","调整备注"]];
 
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await writeFile(dbPath, JSON.stringify(seed, null, 2));
-  }
-  return JSON.parse(await readFile(dbPath, "utf8"));
-}
-async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
 async function body(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -62,95 +28,145 @@ function html(res, text) {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(text);
 }
-function newId() { return "MR-" + Date.now(); }
-function computeStats(items) {
-  const stats = Object.fromEntries(statLabels.map(label => [label, 0]));
-  for (const item of items) {
-    if (stats[item.status] !== undefined) stats[item.status] += 1;
-  }
-  return stats;
+const ERROR_STATUS = { invalid_input: 400, not_found: 404, model_not_found: 404 };
+function sendResult(res, result, okStatus = 200) {
+  if (result?.error) return send(res, ERROR_STATUS[result.error] || 409, result);
+  send(res, okStatus, result);
 }
-function summarize(item) {
-  const logCount = (item.logs || []).length + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
-  return { ...item, logCount };
-}
+
 function page() {
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>古船模型帆索校准</title>
+  <title>古船模型帆索校准 · 环境补偿闭环</title>
   <style>
     :root { --bg:#f1f3ef; --panel:#fff; --ink:#20241f; --muted:#687066; --line:#d4ddd0; --accent:#526f43; --warn:#9b4937; }
     * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
     header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:center; }
-    h1 { margin:0; font-size:26px; } h2 { margin:0 0 12px; font-size:18px; } main { display:grid; grid-template-columns:380px 1fr; gap:22px; padding:22px 28px; }
+    h1 { margin:0; font-size:26px; } h2 { margin:0 0 12px; font-size:18px; } h3 { margin:0; font-size:16px; }
+    main { display:grid; grid-template-columns:380px 1fr; gap:22px; padding:22px 28px; align-items:start; }
     form,.panel,.card,.stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
-    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; } textarea { min-height:68px; }
-    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; } button.secondary { background:#69736a; }
-    .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:14px; } .stat strong { display:block; font-size:24px; }
-    .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:160px; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
-    .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
+    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; }
+    input,select { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; }
+    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; margin-top:12px; }
+    button.ghost { background:#69736a; }
+    .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:10px; margin-bottom:14px; }
+    .stat strong { display:block; font-size:24px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:12px; }
+    .card { display:grid; gap:8px; align-content:start; }
+    .meta { color:var(--muted); font-size:13px; }
+    .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; width:fit-content; }
+    .warn { color:var(--warn); font-weight:700; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th,td { border-bottom:1px solid var(--line); padding:4px 6px; text-align:left; }
+    th { color:var(--muted); font-weight:400; }
+    section { display:grid; gap:14px; align-content:start; }
     @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
   </style>
 </head>
 <body>
-  <header><div><h1>古船模型帆索校准</h1><div class="meta">模型、帆索任务和校准记录串联</div></div><button id="reload">刷新</button></header>
+  <header>
+    <div><h1>古船模型帆索校准台</h1><div class="meta">环境补偿与批次封存闭环 · 读数统一按 20℃ 折算 · 测点允许 5–35℃ · 相邻读数差 ≤8%</div></div>
+    <button id="reload">刷新</button>
+  </header>
   <main>
     <section>
-      <form id="createForm"><h2>新增模型</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存模型</button></form>
-      <form id="actionForm" style="margin-top:14px"><h2>新增帆索任务</h2><label>选择模型</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><button>提交记录</button></form>
+      <form id="modelForm"><h2>模型档案</h2><div id="modelFields"></div><button>建档</button></form>
+      <form id="batchForm"><h2>开放批次</h2>
+        <label>船台</label><input name="station" required placeholder="如 ST-1">
+        <label>模型</label><select name="modelCode" id="batchModel"></select>
+        <button>开批</button>
+        <div class="meta">同一船台同时仅允许一个开放批次，重复或并发开批返回 409 且不落库。</div>
+      </form>
+      <form id="measureForm"><h2>测量记录</h2>
+        <label>批次</label><select name="batchId" id="measureBatch"></select>
+        <label>类型</label><select name="kind">
+          <option value="initial">初测</option>
+          <option value="remeasure">复测（须换人）</option>
+          <option value="revise">修订初测（批次立即失效）</option>
+        </select>
+        <label>测点</label><input name="point" required placeholder="如 前桅侧支索">
+        <label>温度 ℃</label><input name="temp" type="number" step="0.1" required>
+        <label>读数</label><input name="value" type="number" step="0.01" required>
+        <label>操作人</label><input name="operator" required>
+        <button>提交</button>
+      </form>
     </section>
     <section>
       <div class="stats" id="stats"></div>
-      <div class="toolbar"><select id="statusFilter"><option value="">全部状态</option>${stages.map(s => '<option>'+s+'</option>').join('')}</select><input id="search" placeholder="搜索编号或关键词"></div>
-      <div class="panel"><h2>创建模型后可拆分帆索任务，逐条记录松紧状态、调整备注和完成时间。</h2><div class="grid" id="cards"></div></div>
+      <div class="panel"><h2>批次</h2><div class="grid" id="batches"></div></div>
+      <div class="panel"><h2>失效快照（保留但不计入当前统计）</h2><div id="snapshots" class="meta"></div></div>
     </section>
   </main>
   <script>
-    const fields = [["code","模型编号","text"],["shipType","船型","text"],["scale","比例","text"],["mastCount","桅杆数量","number"],["riggingMaterial","帆索材料","text"],["owner","负责人","text"],["dueDate","交付日期","date"]];
-    const stages = ["待检查","校准中","待复核","已交付"];
-    const extraFields = [["position","索具位置"],["tension","松紧状态"],["note","调整备注"]];
-    const createForm = document.querySelector('#createForm');
-    const actionForm = document.querySelector('#actionForm');
-    const cards = document.querySelector('#cards');
-    const statsEl = document.querySelector('#stats');
-    const itemSelect = document.querySelector('#itemSelect');
-    let items = [];
+    const modelFields = [["code","模型编号","text"],["shipType","船型","text"],["scale","比例","text"],["mastCount","桅杆数量","number"],["riggingMaterial","帆索材料","text"],["owner","负责人","text"],["dueDate","交付日期","date"]];
+    const statusLabel = { open:"开放中", pending_remeasure:"待复测", sealed:"已封存", void:"已失效" };
+    let models = [], batches = [], snapshots = [], stats = {};
+    const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
     async function api(path, options) {
-      const res = await fetch(path, options && options.body ? { ...options, headers:{ 'Content-Type':'application/json' } } : options);
+      const res = await fetch(path, options && options.body ? { ...options, headers:{ "Content-Type":"application/json" } } : options);
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '请求失败');
+      if (!res.ok) throw new Error((data.message || data.error || "请求失败") + "（" + res.status + "）");
       return data;
     }
+    async function run(p) { try { await p; } catch (e) { alert(e.message); } await load(); }
     function renderForms() {
-      document.querySelector('#fields').innerHTML = fields.map(([key,label,type]) => '<label>'+label+'</label><input name="'+key+'" type="'+type+'" '+(key==='code'?'required':'')+'>').join('');
-      document.querySelector('#extraFields').innerHTML = extraFields.map(([key,label]) => '<label>'+label+'</label><input name="'+key+'">').join('');
+      document.querySelector("#modelFields").innerHTML = modelFields.map(([key,label,type]) =>
+        "<label>" + label + "</label><input name=\\"" + key + "\\" type=\\"" + type + "\\" " + (key === "code" ? "required" : "") + ">").join("");
     }
     function render() {
-      itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.name || item.shipType || item.source || item.plateSize || '')+'</option>').join('');
-      const stats = Object.fromEntries(stages.map(s => [s, items.filter(i => i.status === s).length]));
-      statsEl.innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('');
-      const status = document.querySelector('#statusFilter').value;
-      const q = document.querySelector('#search').value.trim();
-      const visible = items.filter(item => (!status || item.status === status) && (!q || JSON.stringify(item).includes(q)));
-      cards.innerHTML = visible.map(item => cardHtml(item)).join('');
-      document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => { await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) }); await load(); });
-      document.querySelectorAll('[data-note]').forEach(btn => btn.onclick = async () => { const id = btn.dataset.note; const note = prompt('记录备注'); if (note) { await api('/api/items/'+id+'/logs', { method:'POST', body: JSON.stringify({ step:'备注', note }) }); await load(); } });
+      const statCards = [["开放中","open"],["待复测","pending_remeasure"],["已封存","sealed"],["已失效","void"],["保留快照","snapshots"]];
+      document.querySelector("#stats").innerHTML = statCards.map(([k,key]) =>
+        '<div class="stat"><span>' + k + '</span><strong>' + (stats[key] ?? 0) + "</strong></div>").join("");
+      document.querySelector("#batchModel").innerHTML = models.map(m =>
+        '<option value="' + esc(m.code) + '">' + esc(m.code) + " · " + esc(m.shipType || "") + "</option>").join("");
+      const active = batches.filter(b => b.status === "open" || b.status === "pending_remeasure");
+      document.querySelector("#measureBatch").innerHTML = active.map(b =>
+        '<option value="' + esc(b.id) + '">' + esc(b.id) + " · " + esc(b.station) + " · " + esc(b.modelCode) + "</option>").join("");
+      document.querySelector("#batches").innerHTML = batches.map(batchCard).join("") || '<div class="meta">暂无批次</div>';
+      document.querySelector("#snapshots").innerHTML = snapshots.map(s =>
+        "<div>" + esc(s.at) + " · " + esc(s.batch.id) + " · " + esc(s.batch.station) + " · 原因 " + esc(s.reason) +
+        " · 原结论 " + esc(s.batch.conclusion ? s.batch.conclusion.result : "无") + "</div>").join("") || "暂无";
+      document.querySelectorAll("[data-seal]").forEach(btn => btn.onclick = () =>
+        run(api("/api/batches/" + btn.dataset.seal + "/seal", { method:"POST", body:"{}" })));
     }
-    function cardHtml(item) {
-      const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
-      const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
-      const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
-      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
+    function batchCard(b) {
+      const rows = b.measurements.map(m =>
+        "<tr><td>" + (m.kind === "initial" ? "初测" : "复测") + "</td><td>" + esc(m.point) + "</td><td>" + m.temp +
+        "℃</td><td>" + m.value + "</td><td>" + m.converted + "</td><td>" + esc(m.operator) + "</td><td>" +
+        (m.qualified ? "合格" : '<span class="warn">待复测</span>') + "</td></tr>").join("");
+      const table = rows ? "<table><tr><th>类型</th><th>测点</th><th>温度</th><th>读数</th><th>折算@20℃</th><th>操作人</th><th>判定</th></tr>" + rows + "</table>" : '<div class="meta">暂无测量</div>';
+      const conclusion = b.conclusion ? '<div class="meta">结论：' + esc(b.conclusion.result) + " · 封存于 " + esc(b.conclusion.sealedAt) + "</div>" : "";
+      const voidInfo = b.status === "void" ? '<div class="warn">已失效（' + esc(b.voidReason || "") + "），快照保留但不计入统计</div>" : "";
+      const sealBtn = (b.status === "open" || b.status === "pending_remeasure") ? '<button data-seal="' + esc(b.id) + '">封存</button>' : "";
+      return '<article class="card"><h3>' + esc(b.id) + " · " + esc(b.station) + '</h3><span class="pill">' + statusLabel[b.status] +
+        '</span><div class="meta">模型 ' + esc(b.modelCode) + " · 开批 " + esc(b.createdAt) + "</div>" + table + conclusion + voidInfo + sealBtn + "</article>";
     }
-    async function load() { items = await api('/api/items'); render(); }
-    createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
-    actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
-    document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
+    async function load() {
+      [models, batches, snapshots, stats] = await Promise.all([
+        api("/api/models"), api("/api/batches"), api("/api/snapshots"), api("/api/stats")]);
+      render();
+    }
+    document.querySelector("#modelForm").onsubmit = event => {
+      event.preventDefault();
+      run(api("/api/models", { method:"POST", body: JSON.stringify(Object.fromEntries(new FormData(event.target))) })
+        .then(() => event.target.reset()));
+    };
+    document.querySelector("#batchForm").onsubmit = event => {
+      event.preventDefault();
+      run(api("/api/batches", { method:"POST", body: JSON.stringify(Object.fromEntries(new FormData(event.target))) }));
+    };
+    document.querySelector("#measureForm").onsubmit = event => {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(event.target));
+      const id = data.batchId; delete data.batchId;
+      const kind = data.kind; delete data.kind;
+      const path = kind === "revise" ? "/api/batches/" + id + "/initial" : "/api/batches/" + id + "/" + kind;
+      run(api(path, { method: kind === "revise" ? "PATCH" : "POST", body: JSON.stringify(data) }));
+    };
+    document.querySelector("#reload").onclick = load;
     renderForms(); load();
   </script>
 </body>
@@ -160,54 +176,45 @@ function page() {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
+
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
-    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
-    if (req.method === "POST" && url.pathname === "/api/items") {
-      const input = await body(req);
-      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建模型" }] };
-      item.tasks = [];
-      db.items.unshift(item);
-      await saveDb(db);
-      return send(res, 201, item);
+
+    // 模型档案
+    if (req.method === "GET" && url.pathname === "/api/models") return send(res, 200, await listModels());
+    if (req.method === "POST" && url.pathname === "/api/models") {
+      return sendResult(res, await createModel(await body(req)), 201);
     }
-    const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
-    if (patch && req.method === "PATCH") {
-      const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
-      await saveDb(db);
-      return send(res, 200, item);
+
+    // 补偿规则
+    if (req.method === "GET" && url.pathname === "/api/compensation/rules") return send(res, 200, getRules());
+
+    // 批次
+    if (req.method === "GET" && url.pathname === "/api/batches") {
+      return send(res, 200, await listBatches(url.searchParams.get("station") || undefined));
     }
-    const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
-    if (log && req.method === "POST") {
-      const item = db.items.find(x => x.id === log[1] || x.code === log[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      const input = await body(req);
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
-      await saveDb(db);
-      return send(res, 201, item);
+    if (req.method === "POST" && url.pathname === "/api/batches") {
+      return sendResult(res, await openBatch(await body(req)), 201);
     }
-    const action = url.pathname.match(/^\/api\/items\/([^/]+)\/action$/);
-    if (action && req.method === "POST") {
-      const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      const input = await body(req);
-      item.logs ||= [];
-      item.tasks ||= [];
-      item.tasks.push({ id: "T-" + Date.now(), position: input.position, tension: input.tension, status: "待检查", logs: [{ at: new Date().toISOString(), note: input.note || "新增帆索任务" }] });
-      item.status = "校准中";
-      item.logs.push({ at: new Date().toISOString(), step: "帆索", note: input.position + " · " + input.tension });
-      await saveDb(db);
-      return send(res, 201, item);
+    const batchGet = url.pathname.match(/^\/api\/batches\/([^/]+)$/);
+    if (batchGet && req.method === "GET") {
+      const batch = await getBatch(batchGet[1]);
+      return batch ? send(res, 200, batch) : send(res, 404, { error: "not_found", message: "批次不存在" });
     }
-    if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
+    const initial = url.pathname.match(/^\/api\/batches\/([^/]+)\/initial$/);
+    if (initial && req.method === "POST") return sendResult(res, await addInitial(initial[1], await body(req)), 201);
+    if (initial && req.method === "PATCH") return sendResult(res, await reviseInitial(initial[1], await body(req)));
+    const remeasure = url.pathname.match(/^\/api\/batches\/([^/]+)\/remeasure$/);
+    if (remeasure && req.method === "POST") return sendResult(res, await addRemeasure(remeasure[1], await body(req)), 201);
+    const seal = url.pathname.match(/^\/api\/batches\/([^/]+)\/seal$/);
+    if (seal && req.method === "POST") return sendResult(res, await sealBatch(seal[1], await body(req)));
+
+    // 快照与统计
+    if (req.method === "GET" && url.pathname === "/api/snapshots") return send(res, 200, await listSnapshots());
+    if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, await stats());
+
     send(res, 404, { error: "not_found" });
   } catch (error) {
     send(res, 500, { error: error.message });
   }
 });
-server.listen(port, () => console.log("古船模型帆索校准 listening on http://localhost:" + port));
+server.listen(port, () => console.log("古船模型帆索校准闭环 listening on http://localhost:" + port));
